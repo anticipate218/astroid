@@ -8,7 +8,7 @@ import unittest
 
 import pytest
 
-from astroid import bases, nodes, objects, util
+from astroid import InferenceError, bases, nodes, objects, util
 from astroid.builder import _extract_single_node, extract_node
 
 
@@ -160,14 +160,165 @@ class Number:
         assert [a.name for a in inferit] == [util.Uninferable]
 
 
-def test_slice_with_starred_args() -> None:
+@pytest.mark.parametrize(
+    "arguments",
+    ["*(1, 5, 2)", "*[1, 5, 2]", "1, *(5, 2)", "*(1,), 5, *(2,)", "*(), 1, 5, 2"],
+)
+def test_slice_with_starred_args(arguments: str) -> None:
     """Regression test for https://github.com/pylint-dev/astroid/issues/186.
 
-    The builtin arg-count check used to refuse to infer when ``Call.args``
-    contained a ``Starred`` node, e.g. ``slice(*(1, 2, 3))``.
+    Unpacked arguments must retain the slice bounds, not just its type.
     """
-    node = extract_node("slice(*(1, 2, 3))  #@")
+    node = extract_node(f"slice({arguments})")
     inferred = node.inferred()
     assert len(inferred) == 1
-    assert isinstance(inferred[0], bases.Instance)
+    assert isinstance(inferred[0], nodes.Slice)
     assert inferred[0].pytype() == "builtins.slice"
+    assert (
+        inferred[0].lower.value,
+        inferred[0].upper.value,
+        inferred[0].step.value,
+    ) == (
+        1,
+        5,
+        2,
+    )
+    sliced = next(extract_node(f"[0, 1, 2, 3, 4, 5][slice({arguments})]").infer())
+    assert isinstance(sliced, nodes.List)
+    assert [element.value for element in sliced.elts] == [1, 3]
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        '*(Target, "value")',
+        '*[Target, "value", None]',
+        'Target, *("value",)',
+        '*(), Target, "value"',
+        '*(Target, "missing", 42)',
+        'Target, *("missing",), 42',
+    ],
+)
+def test_getattr_with_starred_args(arguments: str) -> None:
+    node = extract_node(f"""
+        class Target:
+            value = 42
+        getattr({arguments})
+    """)
+    inferred = next(node.infer())
+    assert isinstance(inferred, nodes.Const)
+    assert inferred.value == 42
+
+
+@pytest.mark.parametrize("attribute, expected", [("upper", True), ("missing", False)])
+def test_hasattr_with_starred_args(attribute: str, expected: bool) -> None:
+    node = extract_node(f'hasattr(*("a", "{attribute}"))')
+    inferred = next(node.infer())
+    assert isinstance(inferred, nodes.Const)
+    assert inferred.value is expected
+
+
+@pytest.mark.parametrize("arguments", ["1, *unknown", "1, *42", "*()", "*(1, 2, 3, 4)"])
+def test_slice_with_invalid_starred_args(arguments: str) -> None:
+    inferred = next(extract_node(f"slice({arguments})").infer())
+    assert isinstance(inferred, bases.Instance)
+    assert inferred.pytype() == "builtins.slice"
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    ['"a", "upper", *unknown', '"a", "upper", *42', "*()", '*("a", "upper", 1, 2)'],
+)
+def test_getattr_with_invalid_starred_args(arguments: str) -> None:
+    with pytest.raises(InferenceError):
+        next(extract_node(f"getattr({arguments})").infer())
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    ['"a", "upper", *unknown', '"a", "upper", *42', '*("a", "upper", None)'],
+)
+def test_hasattr_with_invalid_starred_args(arguments: str) -> None:
+    assert next(extract_node(f"hasattr({arguments})").infer()) is util.Uninferable
+
+
+@pytest.mark.parametrize("arguments", ["3", "*(3,)"])
+def test_slice_single_argument_is_stop(arguments: str) -> None:
+    inferred = next(extract_node(f"slice({arguments})").infer())
+    assert isinstance(inferred, nodes.Slice)
+    assert next(inferred.igetattr("start")).value is None
+    assert next(inferred.igetattr("stop")).value == 3
+    assert next(inferred.igetattr("step")).value is None
+    sliced = next(extract_node(f"[0, 1, 2, 3, 4][slice({arguments})]").infer())
+    assert [element.value for element in sliced.elts] == [0, 1, 2]
+
+
+def test_slice_with_two_starred_args() -> None:
+    inferred = next(extract_node("slice(*(1, 4))").infer())
+    assert isinstance(inferred, nodes.Slice)
+    assert next(inferred.igetattr("start")).value == 1
+    assert next(inferred.igetattr("stop")).value == 4
+    assert next(inferred.igetattr("step")).value is None
+
+
+@pytest.mark.parametrize("assigned", [False, True])
+def test_slice_does_not_assume_set_iteration_order(assigned: bool) -> None:
+    code = "args = {5, 1, 2}\nslice(*args)" if assigned else "slice(*{5, 1, 2})"
+    inferred = next(extract_node(code).infer())
+    assert isinstance(inferred, bases.Instance)
+    assert inferred.pytype() == "builtins.slice"
+
+
+@pytest.mark.parametrize("assigned", [False, True])
+def test_getattr_does_not_assume_set_iteration_order(assigned: bool) -> None:
+    code = (
+        'args = {"a", "upper"}\ngetattr(*args)'
+        if assigned
+        else 'getattr(*{"a", "upper"})'
+    )
+    with pytest.raises(InferenceError):
+        next(extract_node(code).infer())
+
+
+@pytest.mark.parametrize("assigned", [False, True])
+def test_hasattr_does_not_assume_set_iteration_order(assigned: bool) -> None:
+    code = (
+        'args = {"a", "upper"}\nhasattr(*args)'
+        if assigned
+        else 'hasattr(*{"a", "upper"})'
+    )
+    assert next(extract_node(code).infer()) is util.Uninferable
+
+
+@pytest.mark.parametrize("keywords", ["extra=True", "**unknown", '**{"extra": True}'])
+def test_getattr_with_starred_args_rejects_keywords(keywords: str) -> None:
+    with pytest.raises(InferenceError):
+        next(extract_node(f'getattr(*("a", "upper"), {keywords})').infer())
+
+
+@pytest.mark.parametrize("keywords", ["extra=True", "**unknown", '**{"extra": True}'])
+def test_hasattr_with_starred_args_rejects_keywords(keywords: str) -> None:
+    assert (
+        next(extract_node(f'hasattr(*("a", "upper"), {keywords})').infer())
+        is util.Uninferable
+    )
+
+
+@pytest.mark.parametrize("keywords", ["stop=5", "**unknown", '**{"stop": 5}'])
+def test_slice_with_starred_args_rejects_keywords(keywords: str) -> None:
+    inferred = next(extract_node(f"slice(*(1, 5, 2), {keywords})").infer())
+    assert isinstance(inferred, bases.Instance)
+    assert inferred.pytype() == "builtins.slice"
+
+
+def test_builtin_starred_args_with_empty_keywords() -> None:
+    method = next(extract_node('getattr(*("a", "upper"), **{})').infer())
+    assert isinstance(method, bases.BoundMethod)
+    assert next(extract_node('hasattr(*("a", "upper"), **{})').infer()).value is True
+    inferred = next(extract_node("slice(*(1, 5, 2), **{})").infer())
+    assert isinstance(inferred, nodes.Slice)
+    assert (inferred.lower.value, inferred.upper.value, inferred.step.value) == (
+        1,
+        5,
+        2,
+    )

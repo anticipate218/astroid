@@ -565,14 +565,28 @@ def infer_super(
     return super_obj
 
 
-def _infer_getattr_args(node, context):
-    if len(node.args) not in (2, 3):
+def _unpack_builtin_args(node, context):
+    for arg in node.args:
+        if isinstance(arg, nodes.Starred):
+            inferred = util.safe_infer(arg.value, context=context)
+            if isinstance(inferred, nodes.Set):
+                raise UseInferenceDefault
+    call = arguments.CallSite.from_call(node, context=context)
+    if call.has_invalid_arguments():
+        raise UseInferenceDefault
+    if call.keyword_arguments or call.has_invalid_keywords():
+        raise UseInferenceDefault
+    return call.positional_arguments
+
+
+def _infer_getattr_args(args, context):
+    if len(args) not in (2, 3):
         # Not a valid getattr call.
         raise UseInferenceDefault
 
     try:
-        obj = next(node.args[0].infer(context=context))
-        attr = next(node.args[1].infer(context=context))
+        obj = next(args[0].infer(context=context))
+        attr = next(args[1].infer(context=context))
     except (InferenceError, StopIteration) as exc:
         raise UseInferenceDefault from exc
 
@@ -596,7 +610,8 @@ def infer_getattr(node, context: InferenceContext | None = None):
     result will be an Uninferable object. Otherwise, the normal attribute
     lookup will be done.
     """
-    obj, attr = _infer_getattr_args(node, context)
+    args = _unpack_builtin_args(node, context)
+    obj, attr = _infer_getattr_args(args, context)
     if (
         isinstance(obj, util.UninferableBase)
         or isinstance(attr, util.UninferableBase)
@@ -607,10 +622,10 @@ def infer_getattr(node, context: InferenceContext | None = None):
     try:
         return next(obj.igetattr(attr, context=context))
     except (StopIteration, InferenceError, AttributeInferenceError):
-        if len(node.args) == 3:
+        if len(args) == 3:
             # Try to infer the default and return it instead.
             try:
-                return next(node.args[2].infer(context=context))
+                return next(args[2].infer(context=context))
             except (StopIteration, InferenceError) as exc:
                 raise UseInferenceDefault from exc
 
@@ -627,7 +642,10 @@ def infer_hasattr(node, context: InferenceContext | None = None):
     when we are unsure of the outcome of the function call.
     """
     try:
-        obj, attr = _infer_getattr_args(node, context)
+        args = _unpack_builtin_args(node, context)
+        if len(args) != 2:
+            return util.Uninferable
+        obj, attr = _infer_getattr_args(args, context)
         if (
             isinstance(obj, util.UninferableBase)
             or isinstance(attr, util.UninferableBase)
@@ -739,7 +757,7 @@ def infer_type(node, context: InferenceContext | None = None):
 
 def infer_slice(node, context: InferenceContext | None = None):
     """Understand `slice` calls."""
-    args = node.args
+    args = _unpack_builtin_args(node, context)
     if not 0 < len(args) <= 3:
         raise UseInferenceDefault
 
@@ -753,6 +771,8 @@ def infer_slice(node, context: InferenceContext | None = None):
         if not isinstance(arg.value, (type(None), int)):
             raise UseInferenceDefault
 
+    if len(args) == 1:
+        args.insert(0, None)
     if len(args) < 3:
         # Make sure we have 3 arguments.
         args.extend([None] * (3 - len(args)))

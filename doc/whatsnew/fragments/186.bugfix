@@ -1,0 +1,5 @@
+Unpack starred arguments when inferring ``slice``, ``getattr`` and ``hasattr`` calls,
+preserving slice bounds and attribute lookup results for known arguments.
+The single argument to ``slice`` is correctly treated as the stop bound.
+
+Refs #186
